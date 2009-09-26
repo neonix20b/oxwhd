@@ -1,0 +1,306 @@
+#!/usr/bin/python
+# -*- coding: utf-8 -*-
+import os, re, time
+from crypt import crypt
+from syslog import *
+from SimpleXMLRPCServer import SimpleXMLRPCServer
+import MySQLdb
+import psycopg2
+import threading
+import oxrpc
+
+oxrpc.URL='http://oxnull.net:1980'
+oxstarter = oxrpc.remoteImport('oxstarter')
+oxrpcthread = oxrpc.remoteImport('oxrpcthread')
+
+
+#config
+MYSQL_DATABASE_DIR='/var/lib/mysql'
+MYSQL_ROOT_PASSWORD='<root_password>'
+USERS_HOME='/home'
+CHECK_INTERVAL=200
+CHECK_PAUSE=30
+SOFT_DIR='/var/lib/oxhosting'
+SOFT = ['joomla','phpbb','wordpress']
+
+cpu_lock = threading.RLock()
+
+def update_pkg():
+    syslog(LOG_INFO, "recreating software packages...")
+    cpu_lock.acquire()
+    try:
+        for soft in SOFT:
+    	    if not os.path.exists('/var/lib/oxhosting/%s' % soft):
+                os.system('mkdir /var/lib/oxhosting/%s' % soft)
+	    os.chdir('/home/pkg_%s/htdocs' % soft)
+	    os.system('rm -f /var/lib/oxhosting/%s/soft.*' % soft)
+	    os.system('tar -cf soft.tar `ls -A`')
+	    os.system('mv soft.tar /var/lib/oxhosting/%s/' % soft)
+	    os.system('mysqldump --user=pkg_%s --password=qwerty92_%s pkg_%s > /var/lib/oxhosting/%s/soft.mysql' % (soft,soft,soft,soft))
+    finally:
+        cpu_lock.release()
+    syslog(LOG_INFO, "finished")
+    return True
+
+
+def register_mysql(id, password):
+   mysql = os.popen('mysql --user=root --password=%s' % MYSQL_ROOT_PASSWORD, 'w')
+   mysql.write('use mysql;\n')
+   mysql.write('CREATE DATABASE ox%s;\n' % id)
+   mysql.write("CREATE USER ox%s@localhost IDENTIFIED BY '%s';\n" % (id, password))
+   mysql.write('GRANT ALL PRIVILEGES on  ox%s.* TO ox%s@localhost WITH GRANT OPTION;\n' % (id,id))
+   mysql.close()
+   syslog(LOG_INFO,'created mysql database for id %s' % id)
+   return True
+
+
+def unregister_mysql(id):
+    mysql = os.popen('mysql --user=root --password=%s' % MYSQL_ROOT_PASSWORD, 'w')
+    mysql.write('use mysql;\n')
+    mysql.write('DROP DATABASE ox%s;\n' % id)
+    mysql.write("DROP USER ox%s@localhost;\n" % id)
+    mysql.close()
+    syslog(LOG_INFO,'removed mysql database for id %s' % id)
+    return True
+
+def create_apache_config(id,domain):
+    id = str(id)
+    config = file('/etc/oxhosting/vhost.conf', 'r')
+    text = config.read()
+    config.close()
+    text = text.replace('%USER_DOMAIN', domain)
+    text = text.replace('%USERS_PREFIX', 'ox')
+    text = text.replace('%USER_ID', id)
+    text = text.replace('%USERS_HOME', USERS_HOME)
+    config = file('/etc/apache2/vhosts.d/%s_%s.oxnull.net.conf' % (id, domain), 'w+')
+    config.write('# Generated on %s\n' % os.popen('date').read())
+    config.write(text)
+    config.close()
+    os.system('ln -s /etc/apache2/vhosts.d/%s_%s.oxnull.net.conf /etc/apache2/vhosts.d/conf_%s' % (id, domain, id))
+    os.system('cat /dev/null > /etc/apache2/vhosts.d/ox%s.aliases' % id)
+    return True
+	
+
+user_lock = threading.RLock()
+
+def register_user(id, domain, password):
+    id = str(id)
+    salt = password[0:2]
+    password = crypt(password, salt)
+    user_lock.acquire()
+    try:
+        os.system('useradd -m -p %s ox%s' % (password, id))
+    finally:
+        user_lock.release()
+    create_apache_config(id,domain)
+    try:
+        os.mkdir('%s/ox%s/cgi-bin' % (USERS_HOME, id))
+	os.system('chmod 700 %s/ox%s/cgi-bin' % (USERS_HOME, id))
+    except: pass
+    try:
+        os.mkdir('%s/ox%s/htdocs' % (USERS_HOME, id))
+	os.system('chmod 700 %s/ox%s/htdocs' % (USERS_HOME, id))
+    except: pass
+    try:
+        os.mkdir('%s/ox%s/error' % (USERS_HOME, id))
+	os.system('chmod 700 %s/ox%s/error' % (USERS_HOME, id))
+    except: pass
+    try:
+        os.mkdir('%s/ox%s/icons' % (USERS_HOME, id))
+	os.system('chmod 700 %s/ox%s/icons' % (USERS_HOME, id))
+    except: pass
+    os.system('chown ox%s.ox%s %s/ox%s -R' % (id, id, USERS_HOME, id))
+    syslog(LOG_INFO, 'created account for id %s(%s)' % (id,domain))
+    return True
+
+
+def unregister_user(id, domain):
+    id = str(id)
+    user_lock.acquire()
+    try:
+        os.system('userdel ox%s' % id)
+    finally:
+        user_lock.release()
+    os.system('rm -rf %s/ox%s' % (USERS_HOME, id))
+    os.system('rm -f /etc/apache2/vhosts.d/%s_%s.oxnull.net.conf' % (id, domain));
+    os.system('rm -f /etc/apache2/vhosts.d/conf_%s' % id)
+    syslog(LOG_INFO,'removed account for id %s(%s)' % (id, domain))
+    return True
+
+
+
+def install_soft(id, domain, password, soft, folder):
+    try:
+        os.mkdir('%s/ox%s/htdocs/%s' % (USERS_HOME, id, folder))
+    except:
+        pass
+    cpu_lock.acquire()
+    try:
+        os.system('tar -C %s/ox%s/htdocs/%s -xf %s/%s/soft.tar' % (USERS_HOME, id, folder, SOFT_DIR, soft))
+        os.system('chown ox%s.ox%s %s/ox%s/htdocs/%s -R' % (id, id, USERS_HOME, id, folder))
+        os.system('mysql ox%s --user=ox%s --password=%s < %s/%s/soft.mysql' % (id, id, password, SOFT_DIR, soft))
+    finally:
+        cpu_lock.release()
+    code = os.system('cd %s/ox%s/htdocs/%s && %s/%s/configure.pl %s %s %s' % (USERS_HOME, id, folder, SOFT_DIR, soft, id, domain, password));
+    if code != 0:
+        syslog(LOG_INFO,"non zero exit code(%d) from '%s'" % (code, '%s/%s/configure.pl %s %s %s' % (SOFT_DIR, soft, id, domain, password)))
+    else:
+        syslog(LOG_INFO,"installed soft '%s' for id %s" % (soft, id))
+    return True
+
+
+apache_lock  = threading.RLock()
+
+def reload_apache_config():
+    apache_lock.acquire()
+    try:
+        os.system('/etc/init.d/apache2 reload')
+    finally:
+        apache_lock.release()
+    return True
+
+
+reload = False
+
+def block_user(id):
+    global reload
+    config = open('/etc/apache2/vhosts.d/conf_' + str(id), 'r')
+    text = config.read()
+    config.close()
+    text=re.sub('#Include \/etc\/oxhosting\/block\.include','Include /etc/oxhosting/block.include',text)
+    config = open('/etc/apache2/vhosts.d/conf_' + str(id), 'w+')
+    config.write(text)
+    config.close()
+    syslog(LOG_INFO, "blocked user #" + str(id));
+    reload = True
+    return True
+
+def unblock_user(id):
+    global reload
+    config = open('/etc/apache2/vhosts.d/conf_' + str(id), 'r')
+    text = config.read()
+    config.close()
+    text=re.sub('Include \/etc\/oxhosting\/block\.include','#Include /etc/oxhosting/block.include',text)
+    config = open('/etc/apache2/vhosts.d/conf_' + str(id), 'w+')
+    config.write(text)
+    config.close()
+    syslog(LOG_INFO, "unblocked user #" + str(id));
+    reload = True
+    return True
+
+def recheck_quotas(id):
+	pgsqlc = pgsql.cursor()
+	pgsqlc2 = pgsql.cursor()
+        pgsqlc.execute('SELECT id, mysql_current_size, mysql_max_size, disk_current_size, disk_max_size FROM webhosting.quotas where id='+str(id))
+	(id, m_current, m_max, d_current, d_max) = pgsqlc.fetchone()
+	pgsqlc.close()
+	pgsql.commit()
+        reload = False
+	mr_size = du(MYSQL_DATABASE_DIR + '/ox' + str(id));
+	dr_size = du(USERS_HOME + '/ox' + str(id));
+	if m_current >= m_max and mr_size < m_max or d_current >= d_max and dr_size < d_max:
+		unblock_user(id)
+        elif m_current < m_max and mr_size > m_max or d_current < d_max and dr_size >= d_max:
+		block_user(id)
+	if reload: os.system('/etc/init.d/apache2 reload')
+	pgsqlc2.execute("UPDATE webhosting.quotas SET mysql_current_size=%s, disk_current_size=%s WHERE id=%d" % (mr_size,dr_size,id))
+	pgsql.commit()
+	
+
+def add_alias(id,alias):
+	aliases = open('/etc/apache2/vhosts.d/ox%s.aliases' % id, 'r')
+	text = aliases.read()
+	aliases.close()
+	text += '\nServerAlias ' + alias
+	aliases = open('/etc/apache2/vhosts.d/ox%s.aliases' % id, 'w')
+        aliases.write(text)
+        aliases.close()
+	return True
+
+def remove_alias(id,alias):
+	aliases = open('/etc/apache2/vhosts.d/ox%s.aliases' % id, 'r')
+	text=''
+	for line in aliases:
+		if line == 'ServerAlias %s\n' % alias or line == 'ServerAlias %s' % alias:
+			continue
+		text += line
+        aliases.close()
+        aliases = open('/etc/apache2/vhosts.d/ox%s.aliases' % id, 'w')
+        aliases.write(text)
+        aliases.close()
+	return True
+
+
+du_re = re.compile('(\d+)')
+
+def du(folder):
+  try:
+    m = du_re.match(os.popen('du -sB1 %s' % folder).read())
+    return int(m.group(1))
+  except:
+    return 0
+
+
+oxstarter.starter('oxwhd')
+
+
+rpc = oxrpcthread.RpcDaemon('89.208.146.82', 1979)
+rpc.export(update_pkg, "update_pkg")
+rpc.export(reload_apache_config, "reload_apache_config")
+rpc.export(register_mysql, "register_mysql")
+rpc.export(unregister_mysql, "unregister_mysql")
+rpc.export(create_apache_config,"create_apache_config")
+rpc.export(register_user, "register_user")
+rpc.export(unregister_user, "unregister_user")
+rpc.export(install_soft, "install_soft")
+rpc.export(add_alias, "add_alias")
+rpc.export(remove_alias, "remove_alias")
+rpc.export(block_user, "block_user")
+rpc.export(unblock_user, "unblock_user")
+rpc.export(recheck_quotas, "recheck_quotas")
+rpc.start()
+
+pgsql = None
+try:
+  pgsql = psycopg2.connect(host="89.208.146.80", user="webhosting", password="webhosting", database="master")
+except StandardError, err:
+  syslog(LOG_EMERG, "exception while connecting to postgresql database")
+  syslog(LOG_EMERG, err.message)
+  exit(1)
+pgsqlc = pgsql.cursor()
+pgsqlc2 = pgsql.cursor()
+
+syslog(LOG_INFO, "Connected to master database. Check interval is %d seconds." % CHECK_INTERVAL);
+
+m_current = None
+m_max = None
+d_current = None
+d_size = None
+
+
+while True:
+    try:
+    	pgsqlc = pgsql.cursor()
+        pgsqlc.execute('SELECT id, mysql_current_size, mysql_max_size, disk_current_size, disk_max_size FROM webhosting.quotas')
+	all = pgsqlc.fetchall()
+	pgsqlc.close()
+	pgsql.commit()
+        for x in all:
+            reload = False
+            (id, m_current, m_max, d_current, d_max) = x
+	    mr_size = du(MYSQL_DATABASE_DIR + '/ox' + str(id));
+	    dr_size = du(USERS_HOME + '/ox' + str(id));
+	    if m_current >= m_max and mr_size < m_max or d_current >= d_max and dr_size < d_max:
+	        unblock_user(id)
+            elif m_current < m_max and mr_size > m_max or d_current < d_max and dr_size >= d_max:
+	        block_user(id)
+	    if reload: os.system('/etc/init.d/apache2 reload')
+	    pgsqlc2.execute("UPDATE webhosting.quotas SET mysql_current_size=%s, disk_current_size=%s WHERE id=%d" % (mr_size,dr_size,id))
+	    pgsql.commit()
+	    time.sleep(CHECK_PAUSE)
+    except StandardError, err:
+        syslog(LOG_EMERG, "exception in main loop")
+        syslog(LOG_EMERG, err.message)        
+	pgsql.rollback()
+    time.sleep(CHECK_INTERVAL)
+

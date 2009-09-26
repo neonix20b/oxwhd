@@ -1,0 +1,7 @@
+#<Location />
+#AuthType Basic
+#AuthName "Private zone"
+#AuthUserFile /etc/oxhosting/passwd
+#Require valid-user
+#</Location>
+

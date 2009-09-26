@@ -1,0 +1,8 @@
+#AddOutputFilterByType LAYOUT text/html
+#LayoutComment On
+#LayoutHeader /etc/oxhosting/ad.html
+#LayoutFooter /etc/oxhosting/link.html
+
+#PythonOutputFilter /usr/sbin/oxhosting/ad_filter.py AdsOutputFilter
+SetOutputFilter INFLATE;OxFilter;OxDigest;DEFLATE
+
