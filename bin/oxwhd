@@ -1,5 +1,4 @@
 #!/usr/bin/python
-# -*- coding: utf-8 -*-
 import os, re, time
 from crypt import crypt
 from syslog import *
@@ -8,6 +7,8 @@ import MySQLdb
 import psycopg2
 import threading
 import oxrpc
+import socket
+#import oxstarter
 
 oxrpc.URL='http://oxnull.net:1980'
 oxstarter = oxrpc.remoteImport('oxstarter')
@@ -16,12 +17,14 @@ oxrpcthread = oxrpc.remoteImport('oxrpcthread')
 
 #config
 MYSQL_DATABASE_DIR='/var/lib/mysql'
-MYSQL_ROOT_PASSWORD='<root_password>'
+MYSQL_ROOT_PASSWORD='GBHjub92'
 USERS_HOME='/home'
 CHECK_INTERVAL=200
 CHECK_PAUSE=30
 SOFT_DIR='/var/lib/oxhosting'
 SOFT = ['joomla','phpbb','wordpress']
+except_users = ['nginx','mysql','smolev','olkhovsky','sshd']
+except_processes=['vsftpd','COMMAND']
 
 cpu_lock = threading.RLock()
 
@@ -89,7 +92,7 @@ def register_user(id, domain, password):
     password = crypt(password, salt)
     user_lock.acquire()
     try:
-        os.system('useradd -m -p %s ox%s' % (password, id))
+        os.system('useradd -m -s /usr/bin/jail -p %s ox%s' % (password, id))
     finally:
         user_lock.release()
     create_apache_config(id,domain)
@@ -109,7 +112,12 @@ def register_user(id, domain, password):
         os.mkdir('%s/ox%s/icons' % (USERS_HOME, id))
 	os.system('chmod 700 %s/ox%s/icons' % (USERS_HOME, id))
     except: pass
+    try:
+        os.mkdir('%s/ox%s/logs' % (USERS_HOME, id))
+	os.system('chmod 700 %s/ox%s/logs' % (USERS_HOME, id))
+    except: pass
     os.system('chown ox%s.ox%s %s/ox%s -R' % (id, id, USERS_HOME, id))
+    os.system('chmod 0750 %s/ox%s' % (USERS_HOME, id))
     syslog(LOG_INFO, 'created account for id %s(%s)' % (id,domain))
     return True
 
@@ -230,6 +238,63 @@ def remove_alias(id,alias):
         aliases.close()
 	return True
 
+def reboot_proc(proc_name):
+	process = os.popen("ps -e| grep %s"%(proc_name)).read()
+	stop_result=""
+	if process:
+		stop_result=os.popen('/etc/init.d/%s stop'%(proc_name)).read()
+		os.system('killall -9 mysqld')
+	result=os.popen('/etc/init.d/%s restart'%(proc_name)).read() 
+	syslog(LOG_INFO, "Reboot process: %s"%(proc_name))
+	syslog(LOG_INFO, stop_result)
+	syslog(LOG_INFO, result)
+	print stop_result
+	print result
+
+def check_mysql():
+	try:
+		db=MySQLdb.connect(passwd="jomiaquughae",db="ox3",host="localhost",user="ox3")
+		return True
+	except StandardError, err:
+		syslog(LOG_INFO,"Mysql is down")
+		print err
+		return False
+
+def check_network(host,port):
+	try:
+		s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+		s.connect((host, port))
+		s.close()
+		return True
+	except socket.error, err:
+		#syslog(LOG_INFO,"%s is down"%())
+		print err
+		return False
+
+def kill_exec_time():
+	result=os.popen("ps -eo pid,user,comm,etime| grep -v -F 'root'| grep -P '\d[1-9]:\d+$'").read()
+	result=result.split("\n")
+	result.remove("")
+	for x in result:
+		proc=x.split();
+		pid=proc[0]
+		user=proc[1]
+		command=proc[2]
+		exec_time=proc[3]
+		if user in except_users: continue
+		if command in except_processes: continue
+		os.system("kill -9 %s"%(pid))
+		syslog(LOG_INFO, "Killed process: %s"%(" ".join(proc)))
+		print " ".join(proc)
+
+def check_state():
+	if	not check_mysql():
+		reboot_proc("mysql")
+	if	not check_network("89.208.146.82",81):
+		reboot_proc("apache2")
+	if	not check_network("89.208.146.82",80):
+		reboot_proc("nginx")
+	kill_exec_time()
 
 du_re = re.compile('(\d+)')
 
@@ -242,6 +307,7 @@ def du(folder):
 
 
 oxstarter.starter('oxwhd')
+
 
 
 rpc = oxrpcthread.RpcDaemon('89.208.146.82', 1979)
@@ -258,6 +324,7 @@ rpc.export(remove_alias, "remove_alias")
 rpc.export(block_user, "block_user")
 rpc.export(unblock_user, "unblock_user")
 rpc.export(recheck_quotas, "recheck_quotas")
+rpc.export(reboot_proc, "reboot_proc")
 rpc.start()
 
 pgsql = None
@@ -270,13 +337,12 @@ except StandardError, err:
 pgsqlc = pgsql.cursor()
 pgsqlc2 = pgsql.cursor()
 
-syslog(LOG_INFO, "Connected to master database. Check interval is %d seconds." % CHECK_INTERVAL);
+syslog(LOG_INFO, "Connected to master database. Check interval is %d seconds.111" % CHECK_INTERVAL);
 
 m_current = None
 m_max = None
 d_current = None
 d_size = None
-
 
 while True:
     try:
@@ -297,10 +363,12 @@ while True:
 	    if reload: os.system('/etc/init.d/apache2 reload')
 	    pgsqlc2.execute("UPDATE webhosting.quotas SET mysql_current_size=%s, disk_current_size=%s WHERE id=%d" % (mr_size,dr_size,id))
 	    pgsql.commit()
+	    check_state()
 	    time.sleep(CHECK_PAUSE)
     except StandardError, err:
         syslog(LOG_EMERG, "exception in main loop")
         syslog(LOG_EMERG, err.message)        
 	pgsql.rollback()
-    time.sleep(CHECK_INTERVAL)
-
+	for i in range(1, 10):
+		check_state()
+		time.sleep(CHECK_INTERVAL/10)
